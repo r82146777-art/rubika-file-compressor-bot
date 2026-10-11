@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-نسخه یک‌باراجرای ربات برای GitHub Actions
-هر ۵ دقیقه اجرا می‌شود، پیام‌های جدید را پردازش می‌کند و خارج می‌شود.
-"""
+"""نسخه یک‌باراجرا برای GitHub Actions - هر ۵ دقیقه"""
 import requests
 import os
 import json
@@ -20,22 +17,32 @@ TEMP_DIR.mkdir(exist_ok=True)
 def api(method, data=None):
     url = f"{API}/{method}"
     try:
-        r = requests.post(url, json=data or {}, timeout=45)
-        return r.json()
+        r = requests.post(url, json=data or {}, timeout=50)
+        print(f"API {method} status={r.status_code}")
+        try:
+            return r.json()
+        except Exception:
+            print(f"API raw: {r.text[:500]}")
+            return None
     except Exception as e:
-        print(f"API Error: {e}")
+        print(f"API Error {method}: {e}")
         return None
 
 def send_message(chat_id, text, inline_keypad=None):
     data = {"chat_id": chat_id, "text": text}
     if inline_keypad:
         data["inline_keypad"] = inline_keypad
-    return api("sendMessage", data)
+    res = api("sendMessage", data)
+    print(f"sendMessage result: {res}")
+    return res
 
 def get_file(file_id):
     res = api("getFile", {"file_id": file_id})
     if res and res.get("status") == "OK":
-        return res.get("data", {}).get("download_url")
+        return res.get("data", {}).get("download_url") or res.get("data", {}).get("download_url")
+    # ساختارهای مختلف
+    if res and isinstance(res.get("data"), dict):
+        return res["data"].get("download_url")
     return None
 
 def download_file(url, save_path):
@@ -62,6 +69,7 @@ def upload_file(upload_url, file_path, file_name):
             files = {"file": (file_name, f)}
             r = requests.post(upload_url, files=files, timeout=180)
             res = r.json()
+            print(f"upload result keys: {list(res.keys()) if isinstance(res, dict) else res}")
             if res.get("status") == "OK":
                 return res.get("data", {}).get("file_id")
     except Exception as e:
@@ -83,7 +91,8 @@ def compress_video(input_path, output_path, crf=28):
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
         return True
-    except:
+    except Exception as e:
+        print(f"compress_video error: {e}")
         return False
 
 def compress_audio(input_path, output_path, bitrate="96k"):
@@ -91,7 +100,8 @@ def compress_audio(input_path, output_path, bitrate="96k"):
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         return True
-    except:
+    except Exception as e:
+        print(f"compress_audio error: {e}")
         return False
 
 def compress_image(input_path, output_path, quality=70):
@@ -99,7 +109,8 @@ def compress_image(input_path, output_path, quality=70):
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         return True
-    except:
+    except Exception as e:
+        print(f"compress_image error: {e}")
         return False
 
 def compress_pdf(input_path, output_path):
@@ -108,7 +119,7 @@ def compress_pdf(input_path, output_path):
     try:
         subprocess.run(cmd, check=True, timeout=120)
         return True
-    except:
+    except Exception:
         import shutil
         shutil.copy(input_path, output_path)
         return False
@@ -132,7 +143,7 @@ def load_states():
         try:
             with open(STATE_FILE) as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
     return {}
 
@@ -143,7 +154,7 @@ def save_states(states):
 def load_offset():
     if os.path.exists(OFFSET_FILE):
         with open(OFFSET_FILE) as f:
-            return f.read().strip()
+            return f.read().strip() or None
     return None
 
 def save_offset(offset):
@@ -152,29 +163,45 @@ def save_offset(offset):
 
 def process_update(update, user_states):
     try:
-        if "new_message" not in update:
+        print(f"Processing update keys: {list(update.keys()) if isinstance(update, dict) else type(update)}")
+
+        # پشتیبانی از ساختارهای مختلف Rubika
+        msg = None
+        chat_id = None
+
+        if "new_message" in update:
+            msg = update["new_message"]
+            chat_id = update.get("chat_id") or msg.get("chat_id")
+        elif "message" in update:
+            msg = update["message"]
+            chat_id = update.get("chat_id") or msg.get("chat_id")
+        elif update.get("type") == "NewMessage":
+            msg = update.get("new_message") or update
+            chat_id = update.get("chat_id")
+
+        if not msg or not chat_id:
+            print(f"Skip update (no msg/chat_id): {str(update)[:300]}")
             return
 
-        msg = update["new_message"]
-        chat_id = update.get("chat_id")
         text = (msg.get("text") or "").strip()
         aux = msg.get("aux_data") or {}
-        button_id = aux.get("button_id")
+        button_id = aux.get("button_id") if isinstance(aux, dict) else None
 
-        if text in ["/start", "شروع"]:
+        print(f"chat_id={chat_id} text={text[:50]!r} button_id={button_id}")
+
+        if text in ["/start", "شروع", "start"]:
             send_message(chat_id,
                 "سلام 👋\nمن ربات کاهش حجم فایل هستم.\n\n"
-                "فایل (ویدیو، صوت، تصویر، PDF یا هر فایل) رو بفرست.\n"
+                "فایل (ویدیو، صوت، تصویر، PDF) رو بفرست.\n"
                 "بعد گزینه‌های کاهش حجم رو برات می‌فرستم.\n\n"
-                "⚠️ این ربات هر ۵ دقیقه یک‌بار چک می‌کند (GitHub Actions)."
+                "⚠️ پاسخ‌دهی حدود هر ۵ دقیقه یک‌بار است."
             )
             return
 
-        # دکمه انتخاب سطح فشرده‌سازی
         if button_id and chat_id in user_states:
             state = user_states[chat_id]
             level = button_id
-            send_message(chat_id, "⏳ در حال کاهش حجم... (ممکن است چند دقیقه طول بکشد)")
+            send_message(chat_id, "⏳ در حال کاهش حجم... لطفاً صبر کن.")
 
             input_path = state["path"]
             original_name = state["name"]
@@ -217,20 +244,19 @@ def process_update(update, user_states):
                 else:
                     send_message(chat_id, "❌ خطا در لینک آپلود.")
             else:
-                send_message(chat_id, "❌ فشرده‌سازی ناموفق بود (ممکن است فایل بزرگ باشد یا زمان کم).")
+                send_message(chat_id, "❌ فشرده‌سازی ناموفق بود.")
 
             try:
                 if os.path.exists(input_path):
                     os.remove(input_path)
                 if output_path.exists():
                     os.remove(output_path)
-            except:
+            except Exception:
                 pass
             user_states.pop(chat_id, None)
             return
 
-        # دریافت فایل جدید
-        file_info = msg.get("file") or msg.get("file_inline")
+        file_info = msg.get("file") or msg.get("file_inline") or msg.get("document")
         if file_info:
             file_id = file_info.get("file_id") or file_info.get("id")
             file_name = file_info.get("file_name") or file_info.get("name") or "file.bin"
@@ -279,34 +305,66 @@ def process_update(update, user_states):
             )
             return
 
+        # اگر پیام متنی معمولی بود
+        if text and text not in ["/start", "شروع"]:
+            send_message(chat_id, "لطفاً یک فایل بفرست تا حجمش رو کم کنم. یا /start بزن.")
+
     except Exception as e:
         print(f"Process error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def main():
-    print("🤖 One-shot Rubika bot started (GitHub Actions)...")
+    print("🤖 One-shot Rubika bot started...")
     offset = load_offset()
     user_states = load_states()
+    print(f"Loaded offset={offset!r} states_count={len(user_states)}")
 
     data = {"limit": 50}
     if offset:
         data["offset_id"] = offset
 
     res = api("getUpdates", data)
-    if not res or res.get("status") != "OK":
-        print("No updates or API error")
+    print(f"getUpdates full response type={type(res)} keys={list(res.keys()) if isinstance(res, dict) else None}")
+    if res:
+        print(f"getUpdates preview: {str(res)[:800]}")
+
+    if not res:
+        print("No response from getUpdates")
         return
 
-    updates = res.get("data", {}).get("updates", [])
+    # ساختارهای مختلف پاسخ
+    updates = []
+    if isinstance(res, dict):
+        if res.get("status") == "OK":
+            data_part = res.get("data") or {}
+            updates = data_part.get("updates") or data_part.get("update") or []
+            if isinstance(updates, dict):
+                updates = [updates]
+        elif "updates" in res:
+            updates = res["updates"]
+        elif "data" in res and isinstance(res["data"], list):
+            updates = res["data"]
+
     print(f"Received {len(updates)} updates")
 
     for upd in updates:
         process_update(upd, user_states)
-        new_offset = upd.get("message_id") or upd.get("update_id") or upd.get("new_message", {}).get("message_id")
+        # استخراج offset جدید
+        new_offset = None
+        if isinstance(upd, dict):
+            new_offset = (
+                upd.get("message_id")
+                or upd.get("update_id")
+                or (upd.get("new_message") or {}).get("message_id")
+                or upd.get("time")
+            )
         if new_offset:
             offset = str(new_offset)
 
     if offset:
         save_offset(offset)
+        print(f"Saved offset={offset}")
     save_states(user_states)
     print("Done.")
 
