@@ -1,0 +1,32 @@
+name: Rubika File Compressor Bot
+
+on:
+  schedule:
+    # هر ۵ دقیقه
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # امکان اجرای دستی
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg ghostscript
+
+      - name: Run bot (one-shot)
+        env:
+          RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
+        run: python bot_oneshot.py
