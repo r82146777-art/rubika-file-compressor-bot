@@ -38,20 +38,34 @@ def send_message(chat_id, text, inline_keypad=None):
 
 def get_file(file_id):
     res = api("getFile", {"file_id": file_id})
-    if res and res.get("status") == "OK":
-        return res.get("data", {}).get("download_url") or res.get("data", {}).get("download_url")
-    # ساختارهای مختلف
-    if res and isinstance(res.get("data"), dict):
-        return res["data"].get("download_url")
+    print(f"getFile FULL response: {res}")
+    if not res:
+        return None
+    data = res.get("data") if isinstance(res, dict) else None
+    if isinstance(data, dict):
+        for key in ("download_url", "downloadUrl", "url", "file_url", "link"):
+            if data.get(key):
+                return data[key]
+        # گاهی خود data رشته است
+        if isinstance(data, str) and data.startswith("http"):
+            return data
+    # اگر کل پاسخ یک url باشد
+    if isinstance(res, str) and res.startswith("http"):
+        return res
+    if res.get("download_url"):
+        return res["download_url"]
+    print(f"getFile: could not find download url in response")
     return None
 
 def download_file(url, save_path):
     try:
-        with requests.get(url, stream=True, timeout=90) as r:
+        print(f"Downloading from: {url[:120]}...")
+        with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(save_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
+        print(f"Downloaded OK size={os.path.getsize(save_path)}")
         return True
     except Exception as e:
         print(f"Download error: {e}")
@@ -59,8 +73,11 @@ def download_file(url, save_path):
 
 def request_send_file(file_type="File"):
     res = api("requestSendFile", {"type": file_type})
+    print(f"requestSendFile: {res}")
     if res and res.get("status") == "OK":
         return res.get("data", {}).get("upload_url")
+    if isinstance(res, dict) and res.get("data"):
+        return res["data"].get("upload_url")
     return None
 
 def upload_file(upload_url, file_path, file_name):
@@ -69,9 +86,11 @@ def upload_file(upload_url, file_path, file_name):
             files = {"file": (file_name, f)}
             r = requests.post(upload_url, files=files, timeout=180)
             res = r.json()
-            print(f"upload result keys: {list(res.keys()) if isinstance(res, dict) else res}")
+            print(f"upload result: {res}")
             if res.get("status") == "OK":
                 return res.get("data", {}).get("file_id")
+            if isinstance(res.get("data"), dict):
+                return res["data"].get("file_id")
     except Exception as e:
         print(f"Upload error: {e}")
     return None
@@ -165,7 +184,6 @@ def process_update(update, user_states):
     try:
         print(f"Processing update keys: {list(update.keys()) if isinstance(update, dict) else type(update)}")
 
-        # پشتیبانی از ساختارهای مختلف Rubika
         msg = None
         chat_id = None
 
@@ -258,6 +276,7 @@ def process_update(update, user_states):
 
         file_info = msg.get("file") or msg.get("file_inline") or msg.get("document")
         if file_info:
+            print(f"file_info: {file_info}")
             file_id = file_info.get("file_id") or file_info.get("id")
             file_name = file_info.get("file_name") or file_info.get("name") or "file.bin"
 
@@ -269,7 +288,7 @@ def process_update(update, user_states):
 
             download_url = get_file(file_id)
             if not download_url:
-                send_message(chat_id, "❌ لینک دانلود پیدا نشد.")
+                send_message(chat_id, "❌ لینک دانلود پیدا نشد. (ربات در حال دیباگ است)")
                 return
 
             local_path = TEMP_DIR / f"{chat_id}_{int(time.time())}_{file_name}"
@@ -305,7 +324,6 @@ def process_update(update, user_states):
             )
             return
 
-        # اگر پیام متنی معمولی بود
         if text and text not in ["/start", "شروع"]:
             send_message(chat_id, "لطفاً یک فایل بفرست تا حجمش رو کم کنم. یا /start بزن.")
 
@@ -325,15 +343,14 @@ def main():
         data["offset_id"] = offset
 
     res = api("getUpdates", data)
-    print(f"getUpdates full response type={type(res)} keys={list(res.keys()) if isinstance(res, dict) else None}")
+    print(f"getUpdates keys={list(res.keys()) if isinstance(res, dict) else None}")
     if res:
-        print(f"getUpdates preview: {str(res)[:800]}")
+        print(f"getUpdates preview: {str(res)[:1000]}")
 
     if not res:
         print("No response from getUpdates")
         return
 
-    # ساختارهای مختلف پاسخ
     updates = []
     if isinstance(res, dict):
         if res.get("status") == "OK":
@@ -350,14 +367,13 @@ def main():
 
     for upd in updates:
         process_update(upd, user_states)
-        # استخراج offset جدید
         new_offset = None
         if isinstance(upd, dict):
             new_offset = (
                 upd.get("message_id")
                 or upd.get("update_id")
                 or (upd.get("new_message") or {}).get("message_id")
-                or upd.get("time")
+                or str(upd.get("update_time") or "")
             )
         if new_offset:
             offset = str(new_offset)
