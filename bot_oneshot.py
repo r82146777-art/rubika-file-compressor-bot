@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""نسخه یک‌باراجرا برای GitHub Actions - هر ۵ دقیقه"""
+"""
+ربات کاهش حجم خودکار روبیکا (GitHub Actions - هر ۵ دقیقه)
+- بدون سؤال: هر فایل را به کمترین حجم ممکن فشرده می‌کند و همان‌جا برمی‌گرداند
+- فایل‌های قبلاً پردازش‌شده را دوباره کار نمی‌کند
+"""
 import requests
 import os
 import json
@@ -10,35 +14,35 @@ from pathlib import Path
 TOKEN = os.environ.get("RUBIKA_TOKEN") or "CGFIFG0HKQPNRAIYNLROCQIPPCAEZQCHJIDXAUHNTEPRDDEQHNRSELACLTXJAMIN"
 API = f"https://botapi.rubika.ir/v3/{TOKEN}"
 OFFSET_FILE = "offset.txt"
-STATE_FILE = "user_states.json"
+PROCESSED_FILE = "processed_ids.json"
 TEMP_DIR = Path("temp_files")
 TEMP_DIR.mkdir(exist_ok=True)
+
+# حداکثر حجم ورودی برای پردازش (مگابایت) - برای جلوگیری از timeout
+MAX_INPUT_MB = 400
 
 def api(method, data=None):
     url = f"{API}/{method}"
     try:
-        r = requests.post(url, json=data or {}, timeout=50)
-        print(f"API {method} status={r.status_code}")
+        r = requests.post(url, json=data or {}, timeout=60)
+        print(f"API {method} http={r.status_code}")
         try:
             return r.json()
         except Exception:
-            print(f"API raw: {r.text[:500]}")
+            print(f"API raw: {r.text[:400]}")
             return None
     except Exception as e:
         print(f"API Error {method}: {e}")
         return None
 
-def send_message(chat_id, text, inline_keypad=None):
-    data = {"chat_id": chat_id, "text": text}
-    if inline_keypad:
-        data["inline_keypad"] = inline_keypad
-    res = api("sendMessage", data)
-    print(f"sendMessage result: {res}")
+def send_message(chat_id, text):
+    res = api("sendMessage", {"chat_id": chat_id, "text": text})
+    print(f"sendMessage: {res}")
     return res
 
 def get_file(file_id):
     res = api("getFile", {"file_id": file_id})
-    print(f"getFile FULL response: {res}")
+    print(f"getFile: {str(res)[:300]}")
     if not res:
         return None
     data = res.get("data") if isinstance(res, dict) else None
@@ -46,26 +50,21 @@ def get_file(file_id):
         for key in ("download_url", "downloadUrl", "url", "file_url", "link"):
             if data.get(key):
                 return data[key]
-        # گاهی خود data رشته است
-        if isinstance(data, str) and data.startswith("http"):
-            return data
-    # اگر کل پاسخ یک url باشد
-    if isinstance(res, str) and res.startswith("http"):
-        return res
-    if res.get("download_url"):
+    if isinstance(res, dict) and res.get("download_url"):
         return res["download_url"]
-    print(f"getFile: could not find download url in response")
     return None
 
 def download_file(url, save_path):
     try:
-        print(f"Downloading from: {url[:120]}...")
-        with requests.get(url, stream=True, timeout=120) as r:
+        print(f"Downloading...")
+        with requests.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
             with open(save_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        print(f"Downloaded OK size={os.path.getsize(save_path)}")
+                for chunk in r.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+        size = os.path.getsize(save_path)
+        print(f"Downloaded size={size}")
         return True
     except Exception as e:
         print(f"Download error: {e}")
@@ -73,24 +72,26 @@ def download_file(url, save_path):
 
 def request_send_file(file_type="File"):
     res = api("requestSendFile", {"type": file_type})
-    print(f"requestSendFile: {res}")
-    if res and res.get("status") == "OK":
-        return res.get("data", {}).get("upload_url")
-    if isinstance(res, dict) and res.get("data"):
-        return res["data"].get("upload_url")
+    if not res:
+        return None
+    data = res.get("data") if isinstance(res, dict) else {}
+    if isinstance(data, dict):
+        return data.get("upload_url")
     return None
 
 def upload_file(upload_url, file_path, file_name):
     try:
         with open(file_path, "rb") as f:
             files = {"file": (file_name, f)}
-            r = requests.post(upload_url, files=files, timeout=180)
+            r = requests.post(upload_url, files=files, timeout=600)
             res = r.json()
-            print(f"upload result: {res}")
-            if res.get("status") == "OK":
-                return res.get("data", {}).get("file_id")
-            if isinstance(res.get("data"), dict):
-                return res["data"].get("file_id")
+            print(f"upload: {str(res)[:300]}")
+            if isinstance(res, dict):
+                data = res.get("data") or {}
+                if isinstance(data, dict) and data.get("file_id"):
+                    return data["file_id"]
+                if res.get("file_id"):
+                    return res["file_id"]
     except Exception as e:
         print(f"Upload error: {e}")
     return None
@@ -104,228 +105,258 @@ def send_file(chat_id, file_id, text=None):
 def get_file_size_mb(path):
     return os.path.getsize(path) / (1024 * 1024)
 
-def compress_video(input_path, output_path, crf=28):
-    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-c:v", "libx264", "-crf", str(crf),
-           "-preset", "fast", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(output_path)]
+def detect_type(file_name):
+    ext = Path(file_name).suffix.lower()
+    if ext in [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".3gp"]:
+        return "video"
+    if ext in [".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"]:
+        return "audio"
+    if ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"]:
+        return "image"
+    if ext == ".pdf":
+        return "pdf"
+    return "other"
+
+def compress_min(input_path, output_path, ftype):
+    """فشرده‌سازی با کمترین حجم ممکن"""
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        if ftype == "video":
+            # CRF بالا = حجم کمتر
+            cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-c:v", "libx264", "-crf", "32", "-preset", "veryfast",
+                "-vf", "scale='min(1280,iw)':-2",
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart", str(output_path)
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+            return True
+        if ftype == "audio":
+            cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-c:a", "libmp3lame", "-b:a", "48k", str(output_path)
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+            return True
+        if ftype == "image":
+            out = str(output_path)
+            if not out.lower().endswith((".jpg", ".jpeg")):
+                out = str(Path(output_path).with_suffix(".jpg"))
+                output_path = Path(out)
+            cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-q:v", "12", str(output_path)
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            return True
+        if ftype == "pdf":
+            cmd = [
+                "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+                "-dPDFSETTINGS=/screen", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                f"-sOutputFile={output_path}", str(input_path)
+            ]
+            try:
+                subprocess.run(cmd, check=True, timeout=300)
+                return True
+            except Exception:
+                import shutil
+                shutil.copy(input_path, output_path)
+                return True
+        # other -> zip
+        import zipfile
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+            z.write(input_path, arcname=os.path.basename(input_path))
         return True
     except Exception as e:
-        print(f"compress_video error: {e}")
+        print(f"compress error: {e}")
         return False
 
-def compress_audio(input_path, output_path, bitrate="96k"):
-    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-c:a", "libmp3lame", "-b:a", bitrate, str(output_path)]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-        return True
-    except Exception as e:
-        print(f"compress_audio error: {e}")
-        return False
-
-def compress_image(input_path, output_path, quality=70):
-    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-q:v", str(int((100 - quality) / 5) + 2), str(output_path)]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        return True
-    except Exception as e:
-        print(f"compress_image error: {e}")
-        return False
-
-def compress_pdf(input_path, output_path):
-    cmd = ["gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4", "-dPDFSETTINGS=/ebook",
-           "-dNOPAUSE", "-dQUIET", "-dBATCH", f"-sOutputFile={output_path}", str(input_path)]
-    try:
-        subprocess.run(cmd, check=True, timeout=120)
-        return True
-    except Exception:
-        import shutil
-        shutil.copy(input_path, output_path)
-        return False
-
-def make_zip(input_path, output_path):
-    import zipfile
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        z.write(input_path, arcname=os.path.basename(input_path))
-    return True
-
-def make_size_keyboard(file_type):
-    if file_type in ["video", "audio"]:
-        options = [("کم (حجم کمتر)", "low"), ("متوسط", "medium"), ("بالا (کیفیت بهتر)", "high")]
-    else:
-        options = [("حداکثر فشرده‌سازی", "max"), ("متوسط", "medium"), ("کم", "low")]
-    rows = [{"buttons": [{"id": v, "type": "Simple", "button_text": t}]} for t, v in options]
-    return {"rows": rows}
-
-def load_states():
-    if os.path.exists(STATE_FILE):
+def load_json(path, default):
+    if os.path.exists(path):
         try:
-            with open(STATE_FILE) as f:
+            with open(path) as f:
                 return json.load(f)
         except Exception:
             pass
-    return {}
+    return default
 
-def save_states(states):
-    with open(STATE_FILE, "w") as f:
-        json.dump(states, f)
+def save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f)
 
 def load_offset():
     if os.path.exists(OFFSET_FILE):
         with open(OFFSET_FILE) as f:
-            return f.read().strip() or None
+            v = f.read().strip()
+            return v or None
     return None
 
 def save_offset(offset):
     with open(OFFSET_FILE, "w") as f:
         f.write(str(offset))
 
-def process_update(update, user_states):
-    try:
-        print(f"Processing update keys: {list(update.keys()) if isinstance(update, dict) else type(update)}")
+def process_file_message(chat_id, msg, processed):
+    file_info = msg.get("file") or msg.get("file_inline") or msg.get("document")
+    if not file_info:
+        return False
 
+    message_id = str(msg.get("message_id") or "")
+    file_id = file_info.get("file_id") or file_info.get("id")
+    file_name = file_info.get("file_name") or file_info.get("name") or "file.bin"
+    size_hint = file_info.get("size") or 0
+    try:
+        size_hint = int(size_hint)
+    except Exception:
+        size_hint = 0
+
+    # جلوگیری از پردازش تکراری
+    keys = []
+    if message_id:
+        keys.append(f"msg:{message_id}")
+    if file_id:
+        keys.append(f"file:{file_id}")
+
+    for k in keys:
+        if k in processed:
+            print(f"SKIP already processed: {k}")
+            return True  # handled (skip)
+
+    if not file_id:
+        send_message(chat_id, "❌ اطلاعات فایل پیدا نشد.")
+        return True
+
+    size_mb_hint = size_hint / (1024 * 1024) if size_hint else 0
+    if size_mb_hint > MAX_INPUT_MB:
+        send_message(chat_id, f"❌ فایل خیلی بزرگ است ({size_mb_hint:.0f} MB). حداکثر حدود {MAX_INPUT_MB} MB.")
+        for k in keys:
+            processed[k] = time.time()
+        return True
+
+    send_message(chat_id, "📥 فایل دریافت شد. در حال کاهش حجم به کمترین حالت ممکن...")
+
+    download_url = get_file(file_id)
+    if not download_url:
+        send_message(chat_id, "❌ لینک دانلود پیدا نشد.")
+        return True
+
+    safe_name = "".join(c if c.isalnum() or c in ".-_" else "_" for c in file_name)[:80]
+    local_path = TEMP_DIR / f"in_{int(time.time())}_{safe_name}"
+    if not download_file(download_url, local_path):
+        send_message(chat_id, "❌ دانلود ناموفق بود.")
+        return True
+
+    old_size = get_file_size_mb(local_path)
+    ftype = detect_type(file_name)
+
+    if ftype == "video":
+        out_name = Path(safe_name).stem + "_min.mp4"
+    elif ftype == "audio":
+        out_name = Path(safe_name).stem + "_min.mp3"
+    elif ftype == "image":
+        out_name = Path(safe_name).stem + "_min.jpg"
+    elif ftype == "pdf":
+        out_name = Path(safe_name).stem + "_min.pdf"
+    else:
+        out_name = Path(safe_name).stem + "_min.zip"
+
+    output_path = TEMP_DIR / out_name
+    ok = compress_min(local_path, output_path, ftype)
+
+    if not ok or not output_path.exists():
+        send_message(chat_id, "❌ فشرده‌سازی ناموفق بود.")
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+        for k in keys:
+            processed[k] = time.time()
+        return True
+
+    new_size = get_file_size_mb(output_path)
+    upload_url = request_send_file("File")
+    if not upload_url:
+        send_message(chat_id, "❌ خطا در دریافت لینک آپلود.")
+    else:
+        new_file_id = upload_file(upload_url, output_path, out_name)
+        if new_file_id:
+            reduction = ((old_size - new_size) / max(old_size, 0.01)) * 100
+            caption = (
+                f"✅ فایل با کمترین حجم ممکن آماده شد\n\n"
+                f"قبل: {old_size:.1f} MB\n"
+                f"بعد: {new_size:.1f} MB\n"
+                f"کاهش: {reduction:.0f}%"
+            )
+            send_file(chat_id, new_file_id, text=caption)
+        else:
+            send_message(chat_id, "❌ خطا در آپلود فایل فشرده.")
+
+    # پاکسازی و ثبت به‌عنوان پردازش‌شده
+    for p in (local_path, output_path):
+        try:
+            if p.exists():
+                os.remove(p)
+        except Exception:
+            pass
+
+    for k in keys:
+        processed[k] = time.time()
+    return True
+
+def process_update(update, processed):
+    try:
         msg = None
         chat_id = None
 
         if "new_message" in update:
             msg = update["new_message"]
-            chat_id = update.get("chat_id") or msg.get("chat_id")
-        elif "message" in update:
-            msg = update["message"]
-            chat_id = update.get("chat_id") or msg.get("chat_id")
+            chat_id = update.get("chat_id") or (msg or {}).get("chat_id")
         elif update.get("type") == "NewMessage":
-            msg = update.get("new_message") or update
+            msg = update.get("new_message")
             chat_id = update.get("chat_id")
 
         if not msg or not chat_id:
-            print(f"Skip update (no msg/chat_id): {str(update)[:300]}")
+            return
+
+        message_id = str(msg.get("message_id") or "")
+        if message_id and f"msg:{message_id}" in processed:
+            print(f"SKIP msg already done: {message_id}")
             return
 
         text = (msg.get("text") or "").strip()
-        aux = msg.get("aux_data") or {}
-        button_id = aux.get("button_id") if isinstance(aux, dict) else None
 
-        print(f"chat_id={chat_id} text={text[:50]!r} button_id={button_id}")
-
-        if text in ["/start", "شروع", "start"]:
-            send_message(chat_id,
-                "سلام 👋\nمن ربات کاهش حجم فایل هستم.\n\n"
-                "فایل (ویدیو، صوت، تصویر، PDF) رو بفرست.\n"
-                "بعد گزینه‌های کاهش حجم رو برات می‌فرستم.\n\n"
-                "⚠️ پاسخ‌دهی حدود هر ۵ دقیقه یک‌بار است."
-            )
-            return
-
-        if button_id and chat_id in user_states:
-            state = user_states[chat_id]
-            level = button_id
-            send_message(chat_id, "⏳ در حال کاهش حجم... لطفاً صبر کن.")
-
-            input_path = state["path"]
-            original_name = state["name"]
-            file_type = state["type"]
-
-            output_name = f"compressed_{original_name}"
-            output_path = TEMP_DIR / output_name
-
-            success = False
-            if file_type == "video":
-                crf = {"low": 32, "medium": 28, "high": 23}.get(level, 28)
-                success = compress_video(input_path, output_path, crf)
-            elif file_type == "audio":
-                br = {"low": "64k", "medium": "96k", "high": "128k"}.get(level, "96k")
-                success = compress_audio(input_path, output_path, br)
-            elif file_type == "image":
-                q = {"max": 50, "medium": 70, "low": 85}.get(level, 70)
-                success = compress_image(input_path, output_path, q)
-            elif file_type == "pdf":
-                success = compress_pdf(input_path, output_path)
-            else:
-                output_path = TEMP_DIR / (Path(original_name).stem + ".zip")
-                success = make_zip(input_path, output_path)
-                output_name = output_path.name
-
-            if success and output_path.exists():
-                new_size = get_file_size_mb(output_path)
-                old_size = state["size"]
-                upload_url = request_send_file("File")
-                if upload_url:
-                    file_id = upload_file(upload_url, output_path, output_name)
-                    if file_id:
-                        caption = (f"✅ فایل کم‌حجم شد!\n\n"
-                                   f"حجم قبلی: {old_size:.1f} MB\n"
-                                   f"حجم جدید: {new_size:.1f} MB\n"
-                                   f"کاهش: {((old_size - new_size) / max(old_size, 0.01) * 100):.0f}%")
-                        send_file(chat_id, file_id, text=caption)
-                    else:
-                        send_message(chat_id, "❌ خطا در آپلود فایل فشرده.")
-                else:
-                    send_message(chat_id, "❌ خطا در لینک آپلود.")
-            else:
-                send_message(chat_id, "❌ فشرده‌سازی ناموفق بود.")
-
-            try:
-                if os.path.exists(input_path):
-                    os.remove(input_path)
-                if output_path.exists():
-                    os.remove(output_path)
-            except Exception:
-                pass
-            user_states.pop(chat_id, None)
-            return
-
-        file_info = msg.get("file") or msg.get("file_inline") or msg.get("document")
-        if file_info:
-            print(f"file_info: {file_info}")
-            file_id = file_info.get("file_id") or file_info.get("id")
-            file_name = file_info.get("file_name") or file_info.get("name") or "file.bin"
-
-            if not file_id:
-                send_message(chat_id, "❌ اطلاعات فایل پیدا نشد.")
-                return
-
-            send_message(chat_id, "📥 در حال دانلود فایل...")
-
-            download_url = get_file(file_id)
-            if not download_url:
-                send_message(chat_id, "❌ لینک دانلود پیدا نشد. (ربات در حال دیباگ است)")
-                return
-
-            local_path = TEMP_DIR / f"{chat_id}_{int(time.time())}_{file_name}"
-            if not download_file(download_url, local_path):
-                send_message(chat_id, "❌ دانلود ناموفق بود.")
-                return
-
-            ext = Path(file_name).suffix.lower()
-            if ext in [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"]:
-                ftype = "video"
-            elif ext in [".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"]:
-                ftype = "audio"
-            elif ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]:
-                ftype = "image"
-            elif ext == ".pdf":
-                ftype = "pdf"
-            else:
-                ftype = "other"
-
-            real_size = get_file_size_mb(local_path)
-            user_states[chat_id] = {
-                "path": str(local_path),
-                "name": file_name,
-                "type": ftype,
-                "size": real_size
-            }
-
-            keyboard = make_size_keyboard(ftype)
+        # /start
+        if text in ("/start", "شروع", "start"):
             send_message(
                 chat_id,
-                f"📁 فایل دریافت شد!\nنام: {file_name}\nحجم: {real_size:.1f} MB\n\nچقدر می‌خوای حجمش کم بشه؟",
-                inline_keypad=keyboard
+                "سلام 👋\n"
+                "هر فایل (ویدیو، صوت، تصویر، PDF و ...) را بفرست.\n"
+                "من خودکار به کمترین حجم ممکن کاهش می‌دهم و برمی‌گردانم.\n"
+                "بدون سؤال و بدون انتخاب.\n\n"
+                "⚠️ پاسخ‌دهی حدود هر ۵ دقیقه یک‌بار است."
             )
+            if message_id:
+                processed[f"msg:{message_id}"] = time.time()
             return
 
-        if text and text not in ["/start", "شروع"]:
-            send_message(chat_id, "لطفاً یک فایل بفرست تا حجمش رو کم کنم. یا /start بزن.")
+        # فایل → فشرده‌سازی خودکار
+        file_info = msg.get("file") or msg.get("file_inline") or msg.get("document")
+        if file_info:
+            process_file_message(chat_id, msg, processed)
+            return
+
+        # دکمه یا متن اضافی را نادیده بگیر (دیگر سؤال نمی‌پرسیم)
+        aux = msg.get("aux_data") or {}
+        if isinstance(aux, dict) and aux.get("button_id"):
+            print(f"Ignore button_id={aux.get('button_id')} (auto mode)")
+            if message_id:
+                processed[f"msg:{message_id}"] = time.time()
+            return
+
+        if text:
+            # فقط یک بار راهنما، نه برای هر متن
+            print(f"Ignore text: {text[:40]!r}")
+            if message_id:
+                processed[f"msg:{message_id}"] = time.time()
 
     except Exception as e:
         print(f"Process error: {e}")
@@ -333,55 +364,48 @@ def process_update(update, user_states):
         traceback.print_exc()
 
 def main():
-    print("🤖 One-shot Rubika bot started...")
+    print("🤖 Auto-compress bot started...")
     offset = load_offset()
-    user_states = load_states()
-    print(f"Loaded offset={offset!r} states_count={len(user_states)}")
+    processed = load_json(PROCESSED_FILE, {})
+    # پاکسازی شناسه‌های قدیمی‌تر از ۷ روز
+    now = time.time()
+    processed = {k: v for k, v in processed.items() if isinstance(v, (int, float)) and now - v < 7 * 86400}
+    print(f"offset={offset!r} processed_count={len(processed)}")
 
     data = {"limit": 50}
     if offset:
         data["offset_id"] = offset
 
     res = api("getUpdates", data)
-    print(f"getUpdates keys={list(res.keys()) if isinstance(res, dict) else None}")
-    if res:
-        print(f"getUpdates preview: {str(res)[:1000]}")
-
     if not res:
-        print("No response from getUpdates")
+        print("No getUpdates response")
         return
 
     updates = []
-    if isinstance(res, dict):
-        if res.get("status") == "OK":
-            data_part = res.get("data") or {}
-            updates = data_part.get("updates") or data_part.get("update") or []
-            if isinstance(updates, dict):
-                updates = [updates]
-        elif "updates" in res:
-            updates = res["updates"]
-        elif "data" in res and isinstance(res["data"], list):
-            updates = res["data"]
+    if isinstance(res, dict) and res.get("status") == "OK":
+        data_part = res.get("data") or {}
+        updates = data_part.get("updates") or []
+        if isinstance(updates, dict):
+            updates = [updates]
 
     print(f"Received {len(updates)} updates")
 
     for upd in updates:
-        process_update(upd, user_states)
-        new_offset = None
+        process_update(upd, processed)
         if isinstance(upd, dict):
             new_offset = (
-                upd.get("message_id")
+                (upd.get("new_message") or {}).get("message_id")
+                or upd.get("message_id")
                 or upd.get("update_id")
-                or (upd.get("new_message") or {}).get("message_id")
-                or str(upd.get("update_time") or "")
+                or upd.get("update_time")
             )
-        if new_offset:
-            offset = str(new_offset)
+            if new_offset:
+                offset = str(new_offset)
 
     if offset:
         save_offset(offset)
         print(f"Saved offset={offset}")
-    save_states(user_states)
+    save_json(PROCESSED_FILE, processed)
     print("Done.")
 
 if __name__ == "__main__":
