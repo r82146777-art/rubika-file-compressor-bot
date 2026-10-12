@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-ربات کاهش حجم خودکار روبیکا (GitHub Actions - هر ۵ دقیقه)
-- بدون سؤال: هر فایل را به کمترین حجم ممکن فشرده می‌کند و همان‌جا برمی‌گرداند
-- فایل‌های قبلاً پردازش‌شده را دوباره کار نمی‌کند
+ربات کاهش حجم خودکار روبیکا (GitHub Actions)
+- بدون سؤال: هر فایل را به کمترین حجم ممکن (زیر سقف ۵۰MB روبیکا) فشرده می‌کند
+- فایل‌های تکراری را دوباره پردازش نمی‌کند
 """
 import requests
 import os
 import json
 import subprocess
 import time
+import mimetypes
 from pathlib import Path
 
 TOKEN = os.environ.get("RUBIKA_TOKEN") or "CGFIFG0HKQPNRAIYNLROCQIPPCAEZQCHJIDXAUHNTEPRDDEQHNRSELACLTXJAMIN"
@@ -18,8 +19,9 @@ PROCESSED_FILE = "processed_ids.json"
 TEMP_DIR = Path("temp_files")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# حداکثر حجم ورودی برای پردازش (مگابایت) - برای جلوگیری از timeout
-MAX_INPUT_MB = 400
+# سقف آپلود روبیکا برای File/Video حدود ۵۰MB است
+MAX_UPLOAD_MB = 45
+MAX_INPUT_MB = 500
 
 def api(method, data=None):
     url = f"{API}/{method}"
@@ -42,7 +44,7 @@ def send_message(chat_id, text):
 
 def get_file(file_id):
     res = api("getFile", {"file_id": file_id})
-    print(f"getFile: {str(res)[:300]}")
+    print(f"getFile: {str(res)[:250]}")
     if not res:
         return None
     data = res.get("data") if isinstance(res, dict) else None
@@ -50,28 +52,27 @@ def get_file(file_id):
         for key in ("download_url", "downloadUrl", "url", "file_url", "link"):
             if data.get(key):
                 return data[key]
-    if isinstance(res, dict) and res.get("download_url"):
-        return res["download_url"]
     return None
 
 def download_file(url, save_path):
     try:
-        print(f"Downloading...")
+        print("Downloading...")
         with requests.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
             with open(save_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 256):
                     if chunk:
                         f.write(chunk)
-        size = os.path.getsize(save_path)
-        print(f"Downloaded size={size}")
+        print(f"Downloaded size={os.path.getsize(save_path)}")
         return True
     except Exception as e:
         print(f"Download error: {e}")
         return False
 
 def request_send_file(file_type="File"):
+    # type: File | Image | Voice | Video | Music | Gif
     res = api("requestSendFile", {"type": file_type})
+    print(f"requestSendFile({file_type}): {res}")
     if not res:
         return None
     data = res.get("data") if isinstance(res, dict) else {}
@@ -81,26 +82,41 @@ def request_send_file(file_type="File"):
 
 def upload_file(upload_url, file_path, file_name):
     try:
+        size = os.path.getsize(file_path)
+        print(f"Uploading {file_name} size={size} bytes to {upload_url[:80]}...")
+        mime = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
         with open(file_path, "rb") as f:
-            files = {"file": (file_name, f)}
+            files = {"file": (file_name, f, mime)}
             r = requests.post(upload_url, files=files, timeout=600)
+        print(f"upload http={r.status_code} body={r.text[:500]}")
+        try:
             res = r.json()
-            print(f"upload: {str(res)[:300]}")
-            if isinstance(res, dict):
+        except Exception:
+            print(f"upload non-json: {r.text[:300]}")
+            return None
+        if isinstance(res, dict):
+            if res.get("status") == "OK":
                 data = res.get("data") or {}
                 if isinstance(data, dict) and data.get("file_id"):
                     return data["file_id"]
-                if res.get("file_id"):
-                    return res["file_id"]
+            # بعضی پاسخ‌ها مستقیم file_id دارند
+            data = res.get("data") or {}
+            if isinstance(data, dict) and data.get("file_id"):
+                return data["file_id"]
+            if res.get("file_id"):
+                return res["file_id"]
+        return None
     except Exception as e:
         print(f"Upload error: {e}")
-    return None
+        return None
 
 def send_file(chat_id, file_id, text=None):
     data = {"chat_id": chat_id, "file_id": file_id}
     if text:
         data["text"] = text
-    return api("sendFile", data)
+    res = api("sendFile", data)
+    print(f"sendFile: {res}")
+    return res
 
 def get_file_size_mb(path):
     return os.path.getsize(path) / (1024 * 1024)
@@ -117,59 +133,94 @@ def detect_type(file_name):
         return "pdf"
     return "other"
 
-def compress_min(input_path, output_path, ftype):
-    """فشرده‌سازی با کمترین حجم ممکن"""
+def rubika_upload_type(ftype):
+    return {
+        "video": "Video",
+        "audio": "Music",
+        "image": "Image",
+        "pdf": "File",
+        "other": "File",
+    }.get(ftype, "File")
+
+def run_ffmpeg(cmd, timeout=900):
     try:
-        if ftype == "video":
-            # CRF بالا = حجم کمتر
-            cmd = [
-                "ffmpeg", "-y", "-i", str(input_path),
-                "-c:v", "libx264", "-crf", "32", "-preset", "veryfast",
-                "-vf", "scale='min(1280,iw)':-2",
-                "-c:a", "aac", "-b:a", "64k",
-                "-movflags", "+faststart", str(output_path)
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
-            return True
-        if ftype == "audio":
-            cmd = [
-                "ffmpeg", "-y", "-i", str(input_path),
-                "-c:a", "libmp3lame", "-b:a", "48k", str(output_path)
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            return True
-        if ftype == "image":
-            out = str(output_path)
-            if not out.lower().endswith((".jpg", ".jpeg")):
-                out = str(Path(output_path).with_suffix(".jpg"))
-                output_path = Path(out)
-            cmd = [
-                "ffmpeg", "-y", "-i", str(input_path),
-                "-q:v", "12", str(output_path)
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-            return True
-        if ftype == "pdf":
-            cmd = [
-                "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-                "-dPDFSETTINGS=/screen", "-dNOPAUSE", "-dQUIET", "-dBATCH",
-                f"-sOutputFile={output_path}", str(input_path)
-            ]
-            try:
-                subprocess.run(cmd, check=True, timeout=300)
-                return True
-            except Exception:
-                import shutil
-                shutil.copy(input_path, output_path)
-                return True
-        # other -> zip
-        import zipfile
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-            z.write(input_path, arcname=os.path.basename(input_path))
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
         return True
     except Exception as e:
-        print(f"compress error: {e}")
+        print(f"ffmpeg failed: {e}")
         return False
+
+def compress_under_limit(input_path, output_path, ftype):
+    """فشرده تا زیر MAX_UPLOAD_MB با چند مرحله تهاجمی‌تر"""
+    attempts = []
+
+    if ftype == "video":
+        attempts = [
+            # (scale, crf, audio_bitrate)
+            ("min(1280,iw)", "28", "96k"),
+            ("min(854,iw)", "32", "64k"),
+            ("min(640,iw)", "36", "48k"),
+            ("min(480,iw)", "40", "32k"),
+        ]
+        for scale, crf, abr in attempts:
+            cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-c:v", "libx264", "-crf", crf, "-preset", "veryfast",
+                "-vf", f"scale='{scale}':-2",
+                "-c:a", "aac", "-b:a", abr,
+                "-movflags", "+faststart", str(output_path),
+            ]
+            if run_ffmpeg(cmd) and output_path.exists():
+                mb = get_file_size_mb(output_path)
+                print(f"video attempt scale={scale} crf={crf} -> {mb:.1f} MB")
+                if mb <= MAX_UPLOAD_MB:
+                    return True
+        return output_path.exists() and get_file_size_mb(output_path) <= MAX_UPLOAD_MB
+
+    if ftype == "audio":
+        for br in ("96k", "64k", "48k", "32k"):
+            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-c:a", "libmp3lame", "-b:a", br, str(output_path)]
+            if run_ffmpeg(cmd, timeout=300) and output_path.exists():
+                mb = get_file_size_mb(output_path)
+                print(f"audio attempt {br} -> {mb:.1f} MB")
+                if mb <= MAX_UPLOAD_MB:
+                    return True
+        return output_path.exists() and get_file_size_mb(output_path) <= MAX_UPLOAD_MB
+
+    if ftype == "image":
+        out = output_path if str(output_path).lower().endswith((".jpg", ".jpeg")) else Path(str(output_path) + ".jpg")
+        for q in ("8", "12", "18", "25"):
+            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-q:v", q, str(out)]
+            if run_ffmpeg(cmd, timeout=120) and out.exists():
+                mb = get_file_size_mb(out)
+                print(f"image attempt q={q} -> {mb:.1f} MB")
+                if mb <= MAX_UPLOAD_MB:
+                    if out != output_path:
+                        out.replace(output_path)
+                    return True
+        if out.exists() and out != output_path:
+            out.replace(output_path)
+        return output_path.exists()
+
+    if ftype == "pdf":
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/screen", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            f"-sOutputFile={output_path}", str(input_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=300)
+            return output_path.exists()
+        except Exception:
+            import shutil
+            shutil.copy(input_path, output_path)
+            return True
+
+    # other -> zip
+    import zipfile
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.write(input_path, arcname=os.path.basename(input_path))
+    return output_path.exists()
 
 def load_json(path, default):
     if os.path.exists(path):
@@ -209,7 +260,6 @@ def process_file_message(chat_id, msg, processed):
     except Exception:
         size_hint = 0
 
-    # جلوگیری از پردازش تکراری
     keys = []
     if message_id:
         keys.append(f"msg:{message_id}")
@@ -219,7 +269,7 @@ def process_file_message(chat_id, msg, processed):
     for k in keys:
         if k in processed:
             print(f"SKIP already processed: {k}")
-            return True  # handled (skip)
+            return True
 
     if not file_id:
         send_message(chat_id, "❌ اطلاعات فایل پیدا نشد.")
@@ -227,12 +277,12 @@ def process_file_message(chat_id, msg, processed):
 
     size_mb_hint = size_hint / (1024 * 1024) if size_hint else 0
     if size_mb_hint > MAX_INPUT_MB:
-        send_message(chat_id, f"❌ فایل خیلی بزرگ است ({size_mb_hint:.0f} MB). حداکثر حدود {MAX_INPUT_MB} MB.")
+        send_message(chat_id, f"❌ فایل خیلی بزرگ است ({size_mb_hint:.0f} MB).")
         for k in keys:
             processed[k] = time.time()
         return True
 
-    send_message(chat_id, "📥 فایل دریافت شد. در حال کاهش حجم به کمترین حالت ممکن...")
+    send_message(chat_id, "📥 فایل دریافت شد.\nدر حال کاهش حجم به زیر ۵۰ مگابایت...")
 
     download_url = get_file(file_id)
     if not download_url:
@@ -260,7 +310,7 @@ def process_file_message(chat_id, msg, processed):
         out_name = Path(safe_name).stem + "_min.zip"
 
     output_path = TEMP_DIR / out_name
-    ok = compress_min(local_path, output_path, ftype)
+    ok = compress_under_limit(local_path, output_path, ftype)
 
     if not ok or not output_path.exists():
         send_message(chat_id, "❌ فشرده‌سازی ناموفق بود.")
@@ -273,24 +323,56 @@ def process_file_message(chat_id, msg, processed):
         return True
 
     new_size = get_file_size_mb(output_path)
-    upload_url = request_send_file("File")
+    print(f"Final size: {new_size:.2f} MB (limit {MAX_UPLOAD_MB})")
+
+    if new_size > MAX_UPLOAD_MB:
+        send_message(
+            chat_id,
+            f"❌ بعد از فشرده‌سازی هنوز حجم زیاد است ({new_size:.1f} MB).\n"
+            f"سقف ارسال روبیکا حدود ۵۰ MB است. لطفاً فایل کوتاه‌تر بفرست."
+        )
+        for p in (local_path, output_path):
+            try:
+                if p.exists():
+                    os.remove(p)
+            except Exception:
+                pass
+        for k in keys:
+            processed[k] = time.time()
+        return True
+
+    upload_type = rubika_upload_type(ftype)
+    upload_url = request_send_file(upload_type)
     if not upload_url:
-        send_message(chat_id, "❌ خطا در دریافت لینک آپلود.")
+        # fallback
+        upload_url = request_send_file("File")
+
+    if not upload_url:
+        send_message(chat_id, "❌ خطا در دریافت لینک آپلود از روبیکا.")
     else:
         new_file_id = upload_file(upload_url, output_path, out_name)
+        if not new_file_id and upload_type != "File":
+            # یک‌بار دیگر با نوع File
+            upload_url2 = request_send_file("File")
+            if upload_url2:
+                new_file_id = upload_file(upload_url2, output_path, out_name)
+
         if new_file_id:
             reduction = ((old_size - new_size) / max(old_size, 0.01)) * 100
             caption = (
-                f"✅ فایل با کمترین حجم ممکن آماده شد\n\n"
+                f"✅ فایل کم‌حجم شد\n\n"
                 f"قبل: {old_size:.1f} MB\n"
                 f"بعد: {new_size:.1f} MB\n"
                 f"کاهش: {reduction:.0f}%"
             )
             send_file(chat_id, new_file_id, text=caption)
         else:
-            send_message(chat_id, "❌ خطا در آپلود فایل فشرده.")
+            send_message(
+                chat_id,
+                f"❌ خطا در آپلود فایل فشرده ({new_size:.1f} MB).\n"
+                f"ممکن است سرور روبیکا موقتاً مشکل داشته باشد. دوباره فایل را بفرست."
+            )
 
-    # پاکسازی و ثبت به‌عنوان پردازش‌شده
     for p in (local_path, output_path):
         try:
             if p.exists():
@@ -324,39 +406,32 @@ def process_update(update, processed):
 
         text = (msg.get("text") or "").strip()
 
-        # /start
         if text in ("/start", "شروع", "start"):
             send_message(
                 chat_id,
                 "سلام 👋\n"
-                "هر فایل (ویدیو، صوت، تصویر، PDF و ...) را بفرست.\n"
-                "من خودکار به کمترین حجم ممکن کاهش می‌دهم و برمی‌گردانم.\n"
-                "بدون سؤال و بدون انتخاب.\n\n"
-                "⚠️ پاسخ‌دهی حدود هر ۵ دقیقه یک‌بار است."
+                "هر فایل را بفرست؛ خودکار به کمترین حجم ممکن (زیر ۵۰ مگ) کم می‌کنم و برمی‌گردانم.\n"
+                "بدون سؤال.\n\n"
+                "⚠️ پاسخ حدود هر ۵ دقیقه یک‌بار است."
             )
             if message_id:
                 processed[f"msg:{message_id}"] = time.time()
             return
 
-        # فایل → فشرده‌سازی خودکار
         file_info = msg.get("file") or msg.get("file_inline") or msg.get("document")
         if file_info:
             process_file_message(chat_id, msg, processed)
             return
 
-        # دکمه یا متن اضافی را نادیده بگیر (دیگر سؤال نمی‌پرسیم)
         aux = msg.get("aux_data") or {}
         if isinstance(aux, dict) and aux.get("button_id"):
-            print(f"Ignore button_id={aux.get('button_id')} (auto mode)")
+            print(f"Ignore button {aux.get('button_id')}")
             if message_id:
                 processed[f"msg:{message_id}"] = time.time()
             return
 
-        if text:
-            # فقط یک بار راهنما، نه برای هر متن
-            print(f"Ignore text: {text[:40]!r}")
-            if message_id:
-                processed[f"msg:{message_id}"] = time.time()
+        if text and message_id:
+            processed[f"msg:{message_id}"] = time.time()
 
     except Exception as e:
         print(f"Process error: {e}")
@@ -367,7 +442,6 @@ def main():
     print("🤖 Auto-compress bot started...")
     offset = load_offset()
     processed = load_json(PROCESSED_FILE, {})
-    # پاکسازی شناسه‌های قدیمی‌تر از ۷ روز
     now = time.time()
     processed = {k: v for k, v in processed.items() if isinstance(v, (int, float)) and now - v < 7 * 86400}
     print(f"offset={offset!r} processed_count={len(processed)}")
