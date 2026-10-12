@@ -8,7 +8,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -43,6 +43,6 @@ jobs:
           name: bot-state
           path: |
             offset.txt
-            user_states.json
+            processed_ids.json
           retention-days: 7
           if-no-files-found: ignore
