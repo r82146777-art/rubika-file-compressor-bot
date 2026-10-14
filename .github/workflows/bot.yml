@@ -8,18 +8,21 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download previous offset/state
-        uses: actions/download-artifact@v4
+      - name: Restore bot state (offset + processed ids)
+        uses: actions/cache/restore@v4
         with:
-          name: bot-state
-          path: .
-        continue-on-error: true
+          path: |
+            offset.txt
+            processed_ids.json
+          key: rubika-bot-state-v2-${{ github.run_id }}
+          restore-keys: |
+            rubika-bot-state-v2-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,12 +40,11 @@ jobs:
           RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
         run: python bot_oneshot.py
 
-      - name: Upload offset/state for next run
-        uses: actions/upload-artifact@v4
+      - name: Save bot state for next runs
+        if: always()
+        uses: actions/cache/save@v4
         with:
-          name: bot-state
           path: |
             offset.txt
             processed_ids.json
-          retention-days: 7
-          if-no-files-found: ignore
+          key: rubika-bot-state-v2-${{ github.run_id }}
