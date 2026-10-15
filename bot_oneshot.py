@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 ربات کاهش حجم خودکار روبیکا (GitHub Actions)
-- هر پیام فایل فقط یک‌بار پردازش می‌شود
-- فشرده‌سازی فوق‌تهاجمی (هدف حدود ۲–۱۰ مگ)
+- هر فایل فقط یک‌بار (بر اساس message_id و file_id)
+- پیام‌های خودِ ربات نادیده گرفته می‌شوند
+- فشرده‌سازی متعادل: حدود ۳۰–۴۵ مگ (کیفیت قابل قبول)
 """
 import requests
 import os
@@ -20,7 +21,6 @@ TEMP_DIR = Path("temp_files")
 TEMP_DIR.mkdir(exist_ok=True)
 
 MAX_UPLOAD_MB = 45
-TARGET_MB = 8
 MAX_INPUT_MB = 600
 MAX_FILES_PER_RUN = 1
 
@@ -138,54 +138,58 @@ def run_ffmpeg(cmd, timeout=1200):
         print(f"ffmpeg failed: {e}")
         return False
 
-def compress_ultra_min(input_path, output_path, ftype):
+def compress_balanced(input_path, output_path, ftype):
+    """فشرده‌سازی متعادل — هدف حدود ۳۰–۴۵ مگ با کیفیت قابل قبول"""
     if ftype == "video":
+        # مثل نسخه قبلی که ۳۰–۳۵ مگ می‌داد (نه نابودی کیفیت)
         attempts = [
-            ("640", "38", "18", "32k"),
-            ("480", "42", "15", "24k"),
-            ("360", "45", "12", "24k"),
-            ("320", "48", "10", "16k"),
-            ("240", "51", "8", "16k"),
+            ("min(1280,iw)", "28", None),
+            ("min(854,iw)", "32", None),
+            ("min(640,iw)", "36", None),
         ]
-        for scale, crf, fps, abr in attempts:
+        for scale, crf, _fps in attempts:
             cmd = [
                 "ffmpeg", "-y", "-i", str(input_path),
                 "-c:v", "libx264", "-crf", crf, "-preset", "veryfast",
-                "-vf", f"scale={scale}:-2,fps={fps}",
-                "-c:a", "aac", "-b:a", abr, "-ac", "1",
+                "-vf", f"scale='{scale}':-2",
+                "-c:a", "aac", "-b:a", "96k",
                 "-movflags", "+faststart", str(output_path),
             ]
             if run_ffmpeg(cmd) and output_path.exists():
                 mb = get_file_size_mb(output_path)
-                print(f"video attempt {scale}p crf={crf} fps={fps} -> {mb:.1f} MB")
-                if mb <= TARGET_MB or scale == "240":
+                print(f"video attempt scale={scale} crf={crf} -> {mb:.1f} MB")
+                if mb <= MAX_UPLOAD_MB:
                     return True
         return output_path.exists() and get_file_size_mb(output_path) <= MAX_UPLOAD_MB
 
     if ftype == "audio":
-        for br in ("48k", "32k", "24k", "16k"):
-            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-c:a", "libmp3lame", "-b:a", br, "-ac", "1", str(output_path)]
+        for br in ("128k", "96k", "64k"):
+            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-c:a", "libmp3lame", "-b:a", br, str(output_path)]
             if run_ffmpeg(cmd, timeout=300) and output_path.exists():
-                print(f"audio {br} -> {get_file_size_mb(output_path):.1f} MB")
-                if get_file_size_mb(output_path) <= TARGET_MB or br == "16k":
+                mb = get_file_size_mb(output_path)
+                print(f"audio {br} -> {mb:.1f} MB")
+                if mb <= MAX_UPLOAD_MB:
                     return True
         return output_path.exists()
 
     if ftype == "image":
         out = output_path if str(output_path).lower().endswith((".jpg", ".jpeg")) else Path(str(output_path) + ".jpg")
-        for scale, q in (("720", "10"), ("480", "12"), ("360", "15"), ("240", "20")):
-            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-vf", f"scale='min({scale},iw)':-2", "-q:v", q, str(out)]
+        for q in ("5", "8", "12"):
+            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-q:v", q, str(out)]
             if run_ffmpeg(cmd, timeout=120) and out.exists():
                 if out != output_path:
                     out.replace(output_path)
-                print(f"image {scale} -> {get_file_size_mb(output_path):.1f} MB")
-                if get_file_size_mb(output_path) <= TARGET_MB or scale == "240":
+                print(f"image q={q} -> {get_file_size_mb(output_path):.1f} MB")
+                if get_file_size_mb(output_path) <= MAX_UPLOAD_MB:
                     return True
         return output_path.exists()
 
     if ftype == "pdf":
-        cmd = ["gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4", "-dPDFSETTINGS=/screen",
-               "-dNOPAUSE", "-dQUIET", "-dBATCH", f"-sOutputFile={output_path}", str(input_path)]
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            f"-sOutputFile={output_path}", str(input_path),
+        ]
         try:
             subprocess.run(cmd, check=True, timeout=300)
             return output_path.exists()
@@ -223,17 +227,23 @@ def save_offset(offset):
     with open(OFFSET_FILE, "w") as f:
         f.write(str(offset))
 
-def mark_processed(processed, message_id, file_id=None):
+def mark_processed(processed, message_id=None, file_id=None):
     now = time.time()
     if message_id:
         processed[f"msg:{message_id}"] = now
     if file_id:
         processed[f"file:{file_id}"] = now
 
-def is_processed(processed, message_id, file_id=None):
-    # فقط message_id معیار اصلی است تا فروارد جدید همان محتوا دوباره کار شود اگر پیام جدید باشد
-    # اما اگر همان message_id باشد رد می‌شود
+def is_processed(processed, message_id=None, file_id=None):
     if message_id and f"msg:{message_id}" in processed:
+        return True
+    if file_id and f"file:{file_id}" in processed:
+        return True
+    return False
+
+def is_from_bot(msg):
+    st = (msg.get("sender_type") or "").lower()
+    if st == "bot":
         return True
     return False
 
@@ -252,7 +262,7 @@ def process_file_message(chat_id, msg, processed):
         size_hint = 0
 
     if is_processed(processed, message_id, file_id):
-        print(f"SKIP already processed msg={message_id}")
+        print(f"SKIP already processed msg={message_id} file={file_id}")
         return True
 
     if not file_id:
@@ -266,7 +276,7 @@ def process_file_message(chat_id, msg, processed):
         mark_processed(processed, message_id, file_id)
         return True
 
-    send_message(chat_id, "📥 فایل دریافت شد.\nدر حال کاهش به کمترین حجم ممکن...")
+    send_message(chat_id, "📥 فایل دریافت شد.\nدر حال کاهش حجم...")
 
     download_url = get_file(file_id)
     if not download_url:
@@ -296,7 +306,7 @@ def process_file_message(chat_id, msg, processed):
         out_name = Path(safe_name).stem + "_min.zip"
 
     output_path = TEMP_DIR / out_name
-    ok = compress_ultra_min(local_path, output_path, ftype)
+    ok = compress_balanced(local_path, output_path, ftype)
 
     if not ok or not output_path.exists():
         send_message(chat_id, "❌ فشرده‌سازی ناموفق بود.")
@@ -311,7 +321,7 @@ def process_file_message(chat_id, msg, processed):
     print(f"Final size: {new_size:.2f} MB")
 
     if new_size > MAX_UPLOAD_MB:
-        send_message(chat_id, f"❌ بعد از حداکثر فشرده‌سازی هنوز {new_size:.1f} MB است (سقف حدود ۵۰MB).")
+        send_message(chat_id, f"❌ بعد از فشرده‌سازی هنوز {new_size:.1f} MB است (سقف حدود ۵۰MB).")
         for p in (local_path, output_path):
             try:
                 if p.exists():
@@ -324,6 +334,7 @@ def process_file_message(chat_id, msg, processed):
     upload_type = rubika_upload_type(ftype)
     upload_url = request_send_file(upload_type) or request_send_file("File")
 
+    new_file_id = None
     if not upload_url:
         send_message(chat_id, "❌ خطا در لینک آپلود.")
     else:
@@ -336,12 +347,14 @@ def process_file_message(chat_id, msg, processed):
         if new_file_id:
             reduction = ((old_size - new_size) / max(old_size, 0.01)) * 100
             caption = (
-                f"✅ فایل با کمترین حجم ممکن آماده شد\n\n"
+                f"✅ فایل کم‌حجم شد\n\n"
                 f"قبل: {old_size:.1f} MB\n"
                 f"بعد: {new_size:.1f} MB\n"
                 f"کاهش: {reduction:.0f}%"
             )
             send_file(chat_id, new_file_id, text=caption)
+            # فایل خروجی ربات را هم علامت بزن تا اگر در آپدیت‌ها آمد دوباره کار نشود
+            mark_processed(processed, file_id=new_file_id)
         else:
             send_message(chat_id, f"❌ خطا در آپلود ({new_size:.1f} MB).")
 
@@ -357,17 +370,16 @@ def process_file_message(chat_id, msg, processed):
 
 def parse_updates(res):
     updates = []
+    next_off = None
     if isinstance(res, dict) and res.get("status") == "OK":
         data_part = res.get("data") or {}
         updates = data_part.get("updates") or []
         if isinstance(updates, dict):
             updates = [updates]
-        # اگر API فیلد next_offset_id داد نگه می‌داریم
         next_off = data_part.get("next_offset_id") or data_part.get("offset_id")
-        return updates, next_off
-    return updates, None
+    return updates, next_off
 
-def extract_file_updates(updates):
+def extract_user_file_updates(updates):
     result = []
     for upd in updates:
         if not isinstance(upd, dict):
@@ -376,15 +388,18 @@ def extract_file_updates(updates):
         chat_id = upd.get("chat_id")
         if not msg or not chat_id:
             continue
-        if msg.get("file") or msg.get("file_inline") or msg.get("document"):
-            mid = str(msg.get("message_id") or "")
-            ut = upd.get("update_time") or msg.get("time") or 0
-            try:
-                ut = int(ut)
-            except Exception:
-                ut = 0
-            result.append((ut, mid, upd, chat_id, msg))
-    # قدیمی → جدید
+        if is_from_bot(msg):
+            print(f"SKIP bot message {msg.get('message_id')}")
+            continue
+        if not (msg.get("file") or msg.get("file_inline") or msg.get("document")):
+            continue
+        mid = str(msg.get("message_id") or "")
+        ut = upd.get("update_time") or msg.get("time") or 0
+        try:
+            ut = int(ut)
+        except Exception:
+            ut = 0
+        result.append((ut, mid, upd, chat_id, msg))
     result.sort(key=lambda x: (x[0], x[1]))
     return result
 
@@ -392,6 +407,11 @@ def process_non_file(update, processed):
     msg = update.get("new_message")
     chat_id = update.get("chat_id")
     if not msg or not chat_id:
+        return
+    if is_from_bot(msg):
+        mid = str(msg.get("message_id") or "")
+        if mid:
+            mark_processed(processed, mid)
         return
     message_id = str(msg.get("message_id") or "")
     if message_id and f"msg:{message_id}" in processed:
@@ -401,41 +421,33 @@ def process_non_file(update, processed):
         send_message(
             chat_id,
             "سلام 👋\n"
-            "فایل بفرست؛ یک‌بار به کمترین حجم ممکن کم می‌کنم و برمی‌گردانم.\n"
+            "فایل بفرست؛ یک‌بار حجمش را کم می‌کنم و برمی‌گردانم.\n"
+            "همان فایل دوباره پردازش نمی‌شود.\n"
             "⚠️ پاسخ حدود چند دقیقه یک‌بار است."
         )
-        mark_processed(processed, message_id)
-        return
     if message_id:
         mark_processed(processed, message_id)
 
-def fetch_all_updates(offset):
-    """اول با offset، اگر خالی بود بدون offset (تا پیام جدید از دست نرود)"""
-    all_updates = []
-    next_off = None
-
+def fetch_updates(offset):
     data = {"limit": 100}
     if offset:
         data["offset_id"] = offset
     res = api("getUpdates", data)
     updates, next_off = parse_updates(res) if res else ([], None)
     print(f"getUpdates(with_offset={bool(offset)}): {len(updates)} updates")
-    all_updates.extend(updates)
 
-    # اگر با offset چیزی نیامد، یک‌بار بدون offset بگیر
     if offset and len(updates) == 0:
-        print("Offset returned 0 — fetching without offset")
+        print("Offset empty — fallback fetch without offset (dedupe by processed list)")
         res2 = api("getUpdates", {"limit": 100})
         updates2, next_off2 = parse_updates(res2) if res2 else ([], None)
         print(f"getUpdates(no offset): {len(updates2)} updates")
-        all_updates.extend(updates2)
+        updates = updates2
         if next_off2:
             next_off = next_off2
 
-    # حذف تکراری بر اساس message_id
     seen = set()
     unique = []
-    for u in all_updates:
+    for u in updates:
         if not isinstance(u, dict):
             continue
         mid = str((u.get("new_message") or {}).get("message_id") or u.get("update_time") or id(u))
@@ -453,7 +465,7 @@ def main():
     processed = {k: v for k, v in processed.items() if isinstance(v, (int, float)) and now - v < 30 * 86400}
     print(f"offset={offset!r} processed_count={len(processed)}")
 
-    updates, api_next_off = fetch_all_updates(offset)
+    updates, api_next_off = fetch_updates(offset)
     print(f"Total unique updates: {len(updates)}")
 
     for upd in updates:
@@ -464,28 +476,41 @@ def main():
         if not has_file:
             process_non_file(upd, processed)
 
-    file_updates = extract_file_updates(updates)
-    print(f"File messages in batch: {len(file_updates)}")
+    file_updates = extract_user_file_updates(updates)
+    print(f"User file messages in batch: {len(file_updates)}")
 
     pending = []
     for ut, mid, upd, chat_id, msg in file_updates:
         finfo = msg.get("file") or msg.get("file_inline") or msg.get("document") or {}
         fid = finfo.get("file_id") or finfo.get("id")
         if is_processed(processed, mid, fid):
-            print(f"SKIP old msg={mid}")
+            print(f"SKIP old msg={mid} file={fid}")
+            # مطمئن شو هر دو کلید ذخیره شده‌اند
+            mark_processed(processed, mid, fid)
             continue
-        pending.append((ut, mid, upd, chat_id, msg))
+        pending.append((ut, mid, upd, chat_id, msg, fid))
 
     print(f"Pending new files: {len(pending)}")
 
-    # فقط جدیدترین فایل را پردازش کن؛ بقیه را برای دور بعد بگذار (علامت نزن)
+    # فقط جدیدترین را پردازش کن
     to_process = pending[-MAX_FILES_PER_RUN:] if pending else []
-    print(f"Will process this run: {len(to_process)}")
 
-    for ut, mid, upd, chat_id, msg in to_process:
+    # بقیه pending را هم همین الان علامت بزن تا دور بعد دوباره نیایند
+    # (صف طولانی باعث تکرار به‌نظر می‌رسید)
+    if len(pending) > MAX_FILES_PER_RUN:
+        for ut, mid, upd, chat_id, msg, fid in pending[:-MAX_FILES_PER_RUN]:
+            print(f"Close backlog without process: msg={mid}")
+            mark_processed(processed, mid, fid)
+
+    for ut, mid, upd, chat_id, msg, fid in to_process:
         process_file_message(chat_id, msg, processed)
 
-    # offset: ترجیح next از API، وگرنه آخرین message_id دیده شده
+    # همه پیام‌های فایل دیده‌شده در این بچ را علامت بزن (حتی اگر از قبل SKIP شده)
+    for ut, mid, upd, chat_id, msg in file_updates:
+        finfo = msg.get("file") or msg.get("file_inline") or msg.get("document") or {}
+        fid = finfo.get("file_id") or finfo.get("id")
+        mark_processed(processed, mid, fid)
+
     new_offset = api_next_off or offset
     for upd in updates:
         if isinstance(upd, dict):
